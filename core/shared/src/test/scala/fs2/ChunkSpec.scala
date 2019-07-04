@@ -3,25 +3,14 @@ package fs2
 import cats.Eq
 import cats.kernel.CommutativeMonoid
 import cats.kernel.laws.discipline.EqTests
-import cats.laws.discipline.{ MonadTests, TraverseTests }
+import cats.laws.discipline.{FunctorFilterTests, MonadTests, TraverseTests}
 import cats.implicits._
-import java.nio.{
-  Buffer => JBuffer,
-  CharBuffer => JCharBuffer,
-  ByteBuffer => JByteBuffer,
-  ShortBuffer => JShortBuffer,
-  IntBuffer => JIntBuffer,
-  DoubleBuffer => JDoubleBuffer,
-  LongBuffer => JLongBuffer,
-  FloatBuffer => JFloatBuffer
-}
-import org.scalacheck.{ Arbitrary, Cogen, Gen }
-import org.scalacheck.util.Buildable
+import org.scalacheck.Cogen
+import org.scalactic.anyvals._
+import org.scalatest.Succeeded
+import org.scalatest.prop.Generator
 import scala.reflect.ClassTag
-import scodec.bits.ByteVector
-
-import TestUtil._
-import ChunkProps._
+import scala.util.control.NonFatal
 
 class ChunkSpec extends Fs2Spec {
 
@@ -40,156 +29,108 @@ class ChunkSpec extends Fs2Spec {
       Chunk.indexedSeq(c).toVector shouldBe c
       Chunk.indexedSeq(c).toList shouldBe c.toList
     }
-  }
 
-  def simpleArbChunk[A](cons: (Array[A], Int, Int) => Chunk[A])(implicit arb: Arbitrary[A], evb: Buildable[A, Array[A]]): Arbitrary[Chunk[A]] =
-    Arbitrary {
-      for {
-        n <- Gen.choose(0, 20)
-        values <- Gen.containerOfN[Array, A](n, arb.arbitrary)
-        offset <- Gen.choose(0, n)
-        sz <- Gen.choose(0, n - offset)
-      } yield cons(values, offset, sz)
+    "Chunk.apply is optimized" in {
+      Chunk(1) shouldBe a[Chunk.Singleton[_]]
+      Chunk("Hello") shouldBe a[Chunk.Singleton[_]]
+      // Varargs on Scala.js use a scala.scalajs.js.WrappedArray, which
+      // ends up falling through to the Chunk.indexedSeq constructor
+      if (isJVM) {
+        Chunk(1, 2, 3) shouldBe a[Chunk.Ints]
+        Chunk("Hello", "world") shouldBe a[Chunk.Boxed[_]]
+      } else {
+        Succeeded
+      }
     }
 
-
-  def bufferArbChunk[A, B <: JBuffer](
-    cons: B => Chunk[A],
-    native: (Int, Array[A]) => B,
-    wrap: Array[A] => B
-  )(implicit arb: Arbitrary[A], evb: Buildable[A, Array[A]]): Arbitrary[Chunk[A]] =
-    Arbitrary {
-      for {
-        n <- Gen.choose(0, 20)
-        values <- Gen.containerOfN[Array, A](n, arb.arbitrary)
-        pos <- Gen.choose(0, n)
-        lim <- Gen.choose(pos, n)
-        direct <- Arbitrary.arbBool.arbitrary
-        bb = if (direct) native(n, values) else wrap(values)
-         _ = bb.position(pos).limit(lim)
-      } yield cons(bb)
+    "Chunk.seq is optimized" in {
+      Chunk.seq(List(1)) shouldBe a[Chunk.Singleton[_]]
     }
 
-  implicit val arbBooleanChunk: Arbitrary[Chunk[Boolean]] =
-    simpleArbChunk(Chunk.booleans _)
-
-  implicit val arbByteChunk: Arbitrary[Chunk[Byte]] =
-    simpleArbChunk(Chunk.bytes _)
-
-  val arbByteBufferChunk: Arbitrary[Chunk[Byte]] =
-    bufferArbChunk[Byte, JByteBuffer](
-      Chunk.byteBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n).put(values),
-      JByteBuffer.wrap _
-    )
-
-  val arbByteVectorChunk: Arbitrary[Chunk[Byte]] = Arbitrary {
-    for {
-      n <- Gen.choose(0, 20)
-      values <- Gen.containerOfN[Array, Byte](n, Arbitrary.arbByte.arbitrary)
-    } yield Chunk.byteVector(ByteVector.view(values))
+    "Array casts in Chunk.seq are safe" in {
+      val as = collection.mutable.ArraySeq[Int](0, 1, 2)
+      val c = Chunk.seq(as)
+      try c shouldBe a[Chunk.Boxed[_]] // 2.11/2.12
+      catch {
+        case NonFatal(t) => c shouldBe a[Chunk.Ints] // 2.13+
+      }
+    }
   }
 
-  val arbFloatBufferChunk: Arbitrary[Chunk[Float]] =
-    bufferArbChunk[Float, JFloatBuffer](
-      Chunk.floatBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n * 4).asFloatBuffer.put(values),
-      JFloatBuffer.wrap _
-    )
-
-
-  val arbShortBufferChunk: Arbitrary[Chunk[Short]] =
-    bufferArbChunk[Short, JShortBuffer](
-      Chunk.shortBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n * 2).asShortBuffer.put(values),
-      JShortBuffer.wrap _
-    )
-
-
-  val arbLongBufferChunk: Arbitrary[Chunk[Long]] =
-    bufferArbChunk[Long, JLongBuffer](
-      Chunk.longBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n * 8).asLongBuffer.put(values),
-      JLongBuffer.wrap _
-    )
-
-  val arbIntBufferChunk: Arbitrary[Chunk[Int]] =
-    bufferArbChunk[Int, JIntBuffer](
-      Chunk.intBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n * 4).asIntBuffer.put(values),
-      JIntBuffer.wrap _
-    )
-
-  val arbDoubleBufferChunk: Arbitrary[Chunk[Double]] =
-    bufferArbChunk[Double, JDoubleBuffer](
-      Chunk.doubleBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n * 8).asDoubleBuffer.put(values),
-      JDoubleBuffer.wrap _
-    )
-
-  val arbCharBufferChunk: Arbitrary[Chunk[Char]] =
-    bufferArbChunk[Char, JCharBuffer](
-      Chunk.charBuffer _,
-      (n, values) => JByteBuffer.allocateDirect(n * 4).asCharBuffer.put(values),
-      JCharBuffer.wrap _
-    )
-
-  implicit val arbShortChunk: Arbitrary[Chunk[Short]] =
-    simpleArbChunk(Chunk.shorts _)
-
-  implicit val arbIntChunk: Arbitrary[Chunk[Int]] =
-    simpleArbChunk(Chunk.ints _)
-
-  implicit val arbLongChunk: Arbitrary[Chunk[Long]] =
-    simpleArbChunk(Chunk.longs _)
-
-  implicit val arbFloatChunk: Arbitrary[Chunk[Float]] =
-    simpleArbChunk(Chunk.floats _)
-
-
-  implicit val arbDoubleChunk: Arbitrary[Chunk[Double]] =
-    simpleArbChunk(Chunk.doubles _)
-
-  def testChunk[A: Arbitrary: ClassTag: Cogen: CommutativeMonoid: Eq](name: String, of: String, testTraverse: Boolean = true)(implicit C: Arbitrary[Chunk[A]]): Unit = {
+  def testChunk[A: Generator: ClassTag: CommutativeMonoid: Eq: Cogen](
+      genChunk: Generator[Chunk[A]],
+      name: String,
+      of: String,
+      testTraverse: Boolean = true): Unit =
     s"$name" - {
-      "size" in propSize[A, Chunk[A]]
-      "take" in propTake[A, Chunk[A]]
-      "drop" in propDrop[A, Chunk[A]]
-      "isEmpty" in propIsEmpty[A, Chunk[A]]
-      "toArray" in propToArray[A, Chunk[A]]
-      "copyToArray" in propCopyToArray[A, Chunk[A]]
-      "concat" in propConcat[A, Chunk[A]]
+      implicit val implicitChunkGenerator: Generator[Chunk[A]] = genChunk
+      "size" in forAll { (c: Chunk[A]) =>
+        c.size shouldBe c.toList.size
+      }
+      "take" in forAll { (c: Chunk[A], n: PosZInt) =>
+        c.take(n).toVector shouldBe c.toVector.take(n)
+      }
+      "drop" in forAll { (c: Chunk[A], n: PosZInt) =>
+        c.drop(n).toVector shouldBe c.toVector.drop(n)
+      }
+      "isEmpty" in forAll { (c: Chunk[A]) =>
+        c.isEmpty shouldBe c.toList.isEmpty
+      }
+      "toArray" in forAll { c: Chunk[A] =>
+        c.toArray.toVector shouldBe c.toVector
+        // Do it twice to make sure the first time didn't mutate state
+        c.toArray.toVector shouldBe c.toVector
+      }
+      "copyToArray" in forAll { c: Chunk[A] =>
+        val arr = new Array[A](c.size * 2)
+        c.copyToArray(arr, 0)
+        c.copyToArray(arr, c.size)
+        arr.toVector shouldBe (c.toVector ++ c.toVector)
+      }
+      "concat" in forAll { (c1: Chunk[A], c2: Chunk[A]) =>
+        Chunk
+          .concat(List(Chunk.empty, c1, Chunk.empty, c2))
+          .toVector shouldBe (c1.toVector ++ c2.toVector)
+      }
 
       if (implicitly[ClassTag[A]] == ClassTag.Byte)
-        "toByteBuffer.byte" in propToByteBuffer[Chunk[Byte]]
+        "toByteBuffer.byte" in forAll { c: Chunk[A] =>
+          implicit val ev: A =:= Byte = null
+          val arr = new Array[Byte](c.size)
+          c.toByteBuffer.get(arr, 0, c.size)
+          arr.toVector shouldBe c.toArray.toVector
+        }
+
+      import org.scalacheck.GeneratorCompat._
 
       checkAll(s"Eq[Chunk[$of]]", EqTests[Chunk[A]].eqv)
       checkAll(s"Monad[Chunk]", MonadTests[Chunk].monad[A, A, A])
+      checkAll(s"FunctorFilter[Chunk]", FunctorFilterTests[Chunk].functorFilter[A, A, A])
 
       if (testTraverse)
         checkAll(s"Traverse[Chunk]", TraverseTests[Chunk].traverse[A, A, A, A, Option, Option])
     }
-  }
 
   implicit val commutativeMonoidForChar = new CommutativeMonoid[Char] {
     def combine(x: Char, y: Char): Char = (x + y).toChar
     def empty: Char = 0
   }
 
-  testChunk[Byte]("Bytes", "Byte")
-  testChunk[Short]("Shorts", "Short")
-  testChunk[Int]("Ints", "Int")
-  testChunk[Long]("Longs", "Long")
+  testChunk[Byte](byteChunkGenerator, "Bytes", "Byte")
+  testChunk[Short](shortChunkGenerator, "Shorts", "Short")
+  testChunk[Int](intChunkGenerator, "Ints", "Int")
+  testChunk[Long](longChunkGenerator, "Longs", "Long")
   // Don't test traverse on Double or Float. They have naughty monoids.
-  testChunk[Double]("Doubles", "Double", false)
-  testChunk[Float]("Floats", "Float", false)
-  testChunk[Char]("Unspecialized", "Char")
-  testChunk[Byte]("ByteBuffer", "Byte")(implicitly, implicitly, implicitly, implicitly, implicitly, arbByteBufferChunk)
-  testChunk[Byte]("ByteVector", "Byte")(implicitly, implicitly, implicitly, implicitly, implicitly, arbByteVectorChunk)
-  testChunk[Int]("IntBuffer", "Int")(implicitly, implicitly, implicitly, implicitly, implicitly, arbIntBufferChunk)
-  testChunk[Float]("FloatBuffer", "Float", false)(implicitly, implicitly, implicitly, implicitly, implicitly, arbFloatBufferChunk)
-  testChunk[Long]("LongBuffer", "Long")(implicitly, implicitly, implicitly, implicitly, implicitly, arbLongBufferChunk)
-  testChunk[Short]("ShortBuffer", "Short")(implicitly, implicitly, implicitly, implicitly, implicitly, arbShortBufferChunk)
-  testChunk[Char]("CharBuffer", "Char")(implicitly, implicitly, implicitly, implicitly, implicitly, arbCharBufferChunk)
-  testChunk[Double]("DoubleBuffer", "Double", false)(implicitly, implicitly, implicitly, implicitly, implicitly, arbDoubleBufferChunk)
+  testChunk[Double](doubleChunkGenerator, "Doubles", "Double", false)
+  testChunk[Float](floatChunkGenerator, "Floats", "Float", false)
+  testChunk[Char](charChunkGenerator, "Unspecialized", "Char")
+
+  testChunk[Byte](byteBufferChunkGenerator, "ByteBuffer", "Byte")
+  testChunk[Byte](byteVectorChunkGenerator, "ByteVector", "Byte")
+  testChunk[Short](shortBufferChunkGenerator, "ShortBuffer", "Short")
+  testChunk[Int](intBufferChunkGenerator, "IntBuffer", "Int")
+  testChunk[Long](longBufferChunkGenerator, "LongBuffer", "Long")
+  testChunk[Double](doubleBufferChunkGenerator, "DoubleBuffer", "Double", false)
+  testChunk[Float](floatBufferChunkGenerator, "FloatBuffer", "Float", false)
+  testChunk[Char](charBufferChunkGenerator, "CharBuffer", "Char")
 }

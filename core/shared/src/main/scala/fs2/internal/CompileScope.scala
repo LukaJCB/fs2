@@ -2,11 +2,12 @@ package fs2.internal
 
 import scala.annotation.tailrec
 
-import cats.Traverse
+import cats.{Traverse, TraverseFilter}
 import cats.data.Chain
 import cats.effect.{Concurrent, ExitCase, Sync}
 import cats.effect.concurrent.{Deferred, Ref}
-import fs2.{CompositeFailure, Scope}
+import cats.implicits._
+import fs2.{CompositeFailure, Pure, Scope}
 import fs2.internal.CompileScope.InterruptContext
 
 /**
@@ -60,36 +61,23 @@ import fs2.internal.CompileScope.InterruptContext
   *                       that eventually allows interruption while eval is evaluating.
   *
   */
-private[fs2] final class CompileScope[F[_], O] private (
+private[fs2] final class CompileScope[F[_]] private (
     val id: Token,
-    private val parent: Option[CompileScope[F, O]],
-    val interruptible: Option[InterruptContext[F, O]]
+    private val parent: Option[CompileScope[F]],
+    val interruptible: Option[InterruptContext[F]]
 )(implicit val F: Sync[F])
     extends Scope[F] { self =>
 
-  private val state: Ref[F, CompileScope.State[F, O]] =
+  private val state: Ref[F, CompileScope.State[F]] =
     Ref.unsafe(CompileScope.State.initial)
 
   /**
     * Registers supplied resource in this scope.
     * This is always invoked before state can be marked as closed.
     */
-  def register(resource: Resource[F]): F[Unit] =
+  private def register(resource: Resource[F]): F[Unit] =
     state.update { s =>
       s.copy(resources = resource +: s.resources)
-    }
-
-  /**
-    * Releases the resource identified by the supplied token.
-    *
-    * Invoked when a resource is released during the scope's lifetime.
-    * When the action returns, the resource may not be released yet, as
-    * it may have been `leased` to other scopes.
-    */
-  def releaseResource(id: Token, ec: ExitCase[Throwable]): F[Either[Throwable, Unit]] =
-    F.flatMap(state.modify { _.unregisterResource(id) }) {
-      case Some(resource) => resource.release(ec)
-      case None           => F.pure(Right(())) // resource does not exist in scope any more.
     }
 
   /**
@@ -103,7 +91,7 @@ private[fs2] final class CompileScope[F[_], O] private (
     */
   def open(
       interruptible: Option[Concurrent[F]]
-  ): F[Either[Throwable, CompileScope[F, O]]] = {
+  ): F[Either[Throwable, CompileScope[F]]] = {
 
     /*
      * Creates a context for a new scope.
@@ -121,40 +109,39 @@ private[fs2] final class CompileScope[F[_], O] private (
      *     or as a result of interrupting this scope. But it should not propagate its own interruption to this scope.
      *
      */
-    def createScopeContext: F[(Option[InterruptContext[F, O]], Token)] = {
+    val createCompileScope: F[CompileScope[F]] = {
       val newScopeId = new Token
       self.interruptible match {
         case None =>
-          F.pure(InterruptContext.unsafeFromInteruptible(interruptible, newScopeId) -> newScopeId)
+          val iCtx = InterruptContext.unsafeFromInterruptible(interruptible, newScopeId)
+          F.pure(new CompileScope[F](newScopeId, Some(self), iCtx))
 
         case Some(parentICtx) =>
-          F.map(parentICtx.childContext(interruptible, newScopeId))(Some(_) -> newScopeId)
+          val fiCtx = parentICtx.childContext(interruptible, newScopeId)
+          F.map(fiCtx)(iCtx => new CompileScope[F](newScopeId, Some(self), Some(iCtx)))
       }
     }
 
-    F.flatMap(createScopeContext) {
-      case (iCtx, newScopeId) =>
-        F.flatMap(state.modify { s =>
-          if (!s.open) (s, None)
-          else {
-            val scope = new CompileScope[F, O](newScopeId, Some(self), iCtx)
-            (s.copy(children = scope +: s.children), Some(scope))
-          }
-        }) {
-          case Some(s) => F.pure(Right(s))
-          case None    =>
-            // This scope is already closed so try to promote the open to an ancestor; this can fail
-            // if the root scope has already been closed, in which case, we can safely throw
-            self.parent match {
-              case Some(parent) =>
-                F.flatMap(self.interruptible.map(_.cancelParent).getOrElse(F.unit)) { _ =>
-                  parent.open(interruptible)
-                }
+    F.flatMap(createCompileScope) { scope =>
+      F.flatMap(state.modify { s =>
+        if (!s.open) (s, None)
+        else
+          (s.copy(children = scope +: s.children), Some(scope))
+      }) {
+        case Some(s) => F.pure(Right(s))
+        case None    =>
+          // This scope is already closed so try to promote the open to an ancestor; this can fail
+          // if the root scope has already been closed, in which case, we can safely throw
+          self.parent match {
+            case Some(parent) =>
+              F.flatMap(self.interruptible.map(_.cancelParent).getOrElse(F.unit)) { _ =>
+                parent.open(interruptible)
+              }
 
-              case None =>
-                F.pure(Left(new IllegalStateException("cannot re-open root scope")))
-            }
-        }
+            case None =>
+              F.pure(Left(new IllegalStateException("cannot re-open root scope")))
+          }
+      }
     }
   }
 
@@ -171,14 +158,14 @@ private[fs2] final class CompileScope[F[_], O] private (
     */
   def acquireResource[R](
       fr: F[R],
-      release: (R, ExitCase[Throwable]) => F[Unit]): F[Either[Throwable, (R, Token)]] = {
+      release: (R, ExitCase[Throwable]) => F[Unit]): F[Either[Throwable, (R, Resource[F])]] = {
     val resource = Resource.create
     F.flatMap(F.attempt(fr)) {
       case Right(r) =>
         val finalizer = (ec: ExitCase[Throwable]) => F.suspend(release(r, ec))
         F.flatMap(resource.acquired(finalizer)) { result =>
-          if (result.right.exists(identity)) F.map(register(resource))(_ => Right((r, resource.id)))
-          else F.pure(Left(result.left.getOrElse(AcquireAfterScopeClosed)))
+          if (result.exists(identity)) F.map(register(resource))(_ => Right((r, resource)))
+          else F.pure(Left(result.swap.getOrElse(AcquireAfterScopeClosed)))
         }
       case Left(err) => F.pure(Left(err))
     }
@@ -190,11 +177,11 @@ private[fs2] final class CompileScope[F[_], O] private (
     * As a result of unregistering a child scope, its resources are no longer
     * reachable from its parent.
     */
-  def releaseChildScope(id: Token): F[Unit] =
+  private def releaseChildScope(id: Token): F[Unit] =
     state.update { _.unregisterChild(id) }
 
   /** Returns all direct resources of this scope (does not return resources in ancestor scopes or child scopes). **/
-  def resources: F[Chain[Resource[F]]] =
+  private def resources: F[Chain[Resource[F]]] =
     F.map(state.get) { _.resources }
 
   /**
@@ -224,22 +211,23 @@ private[fs2] final class CompileScope[F[_], O] private (
     */
   def close(ec: ExitCase[Throwable]): F[Either[Throwable, Unit]] =
     F.flatMap(state.modify(s => s.close -> s)) { previous =>
-      F.flatMap(traverseError[CompileScope[F, O]](previous.children, _.close(ec))) {
-        resultChildren =>
-          F.flatMap(traverseError[Resource[F]](previous.resources, _.release(ec))) {
-            resultResources =>
-              F.flatMap(self.interruptible.map(_.cancelParent).getOrElse(F.unit)) { _ =>
-                F.map(self.parent.fold(F.unit)(_.releaseChildScope(self.id))) { _ =>
-                  val results = resultChildren.left.toSeq ++ resultResources.left.toSeq
-                  CompositeFailure.fromList(results.toList).toLeft(())
-                }
+      F.flatMap(traverseError[CompileScope[F]](previous.children, _.close(ec))) { resultChildren =>
+        F.flatMap(traverseError[Resource[F]](previous.resources, _.release(ec))) {
+          resultResources =>
+            F.flatMap(self.interruptible.map(_.cancelParent).getOrElse(F.unit)) { _ =>
+              F.map(self.parent.fold(F.unit)(_.releaseChildScope(self.id))) { _ =>
+                val results = resultChildren.fold(List(_), _ => Nil) ++ resultResources.fold(
+                  List(_),
+                  _ => Nil)
+                CompositeFailure.fromList(results.toList).toLeft(())
               }
-          }
+            }
+        }
       }
     }
 
   /** Returns closest open parent scope or root. */
-  def openAncestor: F[CompileScope[F, O]] =
+  def openAncestor: F[CompileScope[F]] =
     self.parent.fold(F.pure(self)) { parent =>
       F.flatMap(parent.state.get) { s =>
         if (s.open) F.pure(parent)
@@ -248,20 +236,20 @@ private[fs2] final class CompileScope[F[_], O] private (
     }
 
   /** Gets all ancestors of this scope, inclusive of root scope. **/
-  private def ancestors: F[Chain[CompileScope[F, O]]] = {
+  private def ancestors: Chain[CompileScope[F]] = {
     @tailrec
-    def go(curr: CompileScope[F, O], acc: Chain[CompileScope[F, O]]): F[Chain[CompileScope[F, O]]] =
+    def go(curr: CompileScope[F], acc: Chain[CompileScope[F]]): Chain[CompileScope[F]] =
       curr.parent match {
         case Some(parent) => go(parent, acc :+ parent)
-        case None         => F.pure(acc)
+        case None         => acc
       }
     go(self, Chain.empty)
   }
 
   /** finds ancestor of this scope given `scopeId` **/
-  def findAncestor(scopeId: Token): Option[CompileScope[F, O]] = {
+  def findSelfOrAncestor(scopeId: Token): Option[CompileScope[F]] = {
     @tailrec
-    def go(curr: CompileScope[F, O]): Option[CompileScope[F, O]] =
+    def go(curr: CompileScope[F]): Option[CompileScope[F]] =
       if (curr.id == scopeId) Some(curr)
       else
         curr.parent match {
@@ -271,13 +259,9 @@ private[fs2] final class CompileScope[F[_], O] private (
     go(self)
   }
 
-  def findSelfOrAncestor(scopeId: Token): Option[CompileScope[F, O]] =
-    if (self.id == scopeId) Some(self)
-    else findAncestor(scopeId)
-
   /** finds scope in child hierarchy of current scope **/
-  def findSelfOrChild(scopeId: Token): F[Option[CompileScope[F, O]]] = {
-    def go(scopes: Chain[CompileScope[F, O]]): F[Option[CompileScope[F, O]]] =
+  def findSelfOrChild(scopeId: Token): F[Option[CompileScope[F]]] = {
+    def go(scopes: Chain[CompileScope[F]]): F[Option[CompileScope[F]]] =
       scopes.uncons match {
         case None => F.pure(None)
         case Some((scope, tail)) =>
@@ -309,8 +293,9 @@ private[fs2] final class CompileScope[F[_], O] private (
     * - traverse all known scope ids, starting from the root.
     *
     */
-  def findStepScope(scopeId: Token): F[Option[CompileScope[F, O]]] = {
-    def go(scope: CompileScope[F, O]): CompileScope[F, O] =
+  def findStepScope(scopeId: Token): F[Option[CompileScope[F]]] = {
+    @tailrec
+    def go(scope: CompileScope[F]): CompileScope[F] =
       scope.parent match {
         case None         => scope
         case Some(parent) => go(parent)
@@ -334,24 +319,16 @@ private[fs2] final class CompileScope[F[_], O] private (
     F.flatMap(state.get) { s =>
       if (!s.open) F.pure(None)
       else {
-        F.flatMap(Traverse[Chain].traverse(s.children :+ self)(_.resources)) { childResources =>
-          F.flatMap(ancestors) { anc =>
-            F.flatMap(Traverse[Chain].traverse(anc) { _.resources }) { ancestorResources =>
-              val allLeases = childResources.flatMap(identity) ++ ancestorResources
-                .flatMap(identity)
-              F.map(Traverse[Chain].traverse(allLeases) { r =>
-                r.lease
-              }) { leased =>
-                val allLeases = leased.collect {
-                  case Some(resourceLease) => resourceLease
-                }
-                val lease = new Scope.Lease[F] {
-                  def cancel: F[Either[Throwable, Unit]] =
-                    traverseError[Scope.Lease[F]](allLeases, _.cancel)
-                }
-                Some(lease)
-              }
+        val allScopes = (s.children :+ self) ++ ancestors
+        F.flatMap(Traverse[Chain].flatTraverse(allScopes)(_.resources)) { allResources =>
+          F.map(TraverseFilter[Chain].traverseFilter(allResources) { r =>
+            r.lease
+          }) { allLeases =>
+            val lease = new Scope.Lease[F] {
+              def cancel: F[Either[Throwable, Unit]] =
+                traverseError[Scope.Lease[F]](allLeases, _.cancel)
             }
+            Some(lease)
           }
         }
       }
@@ -365,7 +342,7 @@ private[fs2] final class CompileScope[F[_], O] private (
           new IllegalStateException("Scope#interrupt called for Scope that cannot be interrupted"))
       case Some(iCtx) =>
         // note that we guard interruption here by Attempt to prevent failure on multiple sets.
-        val interruptCause = cause.right.map(_ => iCtx.interruptRoot)
+        val interruptCause = cause.map(_ => iCtx.interruptRoot)
         F.guarantee(iCtx.deferred.complete(interruptCause)) {
           iCtx.ref.update { _.orElse(Some(interruptCause)) }
         }
@@ -397,12 +374,12 @@ private[fs2] final class CompileScope[F[_], O] private (
     */
   private[internal] def interruptibleEval[A](f: F[A]): F[Either[Either[Throwable, Token], A]] =
     interruptible match {
-      case None => F.map(F.attempt(f)) { _.left.map(Left(_)) }
+      case None => F.map(F.attempt(f)) { _.swap.map(Left(_)).swap }
       case Some(iCtx) =>
         F.map(
           iCtx.concurrent
-            .race(iCtx.deferred.get, F.attempt(iCtx.concurrent.uncancelable(f)))) {
-          case Right(result) => result.left.map(Left(_))
+            .race(iCtx.deferred.get, F.attempt(f))) {
+          case Right(result) => result.leftMap(Left(_))
           case Left(other)   => Left(other)
         }
     }
@@ -411,11 +388,11 @@ private[fs2] final class CompileScope[F[_], O] private (
     s"RunFoldScope(id=$id,interruptible=${interruptible.nonEmpty})"
 }
 
-private[internal] object CompileScope {
+private[fs2] object CompileScope {
 
   /** Creates a new root scope. */
-  def newRoot[F[_]: Sync, O]: CompileScope[F, O] =
-    new CompileScope[F, O](new Token(), None, None)
+  def newRoot[F[_]: Sync]: F[CompileScope[F]] =
+    Sync[F].delay(new CompileScope[F](new Token(), None, None))
 
   /**
     * State of a scope.
@@ -431,36 +408,29 @@ private[internal] object CompileScope {
     *                           Still, likewise for resources they are released in reverse order.
     *
     */
-  final private case class State[F[_], O](
+  final private case class State[F[_]](
       open: Boolean,
       resources: Chain[Resource[F]],
-      children: Chain[CompileScope[F, O]]
+      children: Chain[CompileScope[F]]
   ) { self =>
 
-    def unregisterResource(id: Token): (State[F, O], Option[Resource[F]]) =
-      self.resources
-        .deleteFirst(_.id == id)
-        .fold((self, None: Option[Resource[F]])) {
-          case (r, c) =>
-            (self.copy(resources = c), Some(r))
-        }
+    def unregisterChild(id: Token): State[F] =
+      self.children.deleteFirst(_.id == id) match {
+        case Some((_, newChildren)) => self.copy(children = newChildren)
+        case None                   => self
+      }
 
-    def unregisterChild(id: Token): State[F, O] =
-      self.copy(
-        children = self.children.deleteFirst(_.id == id).map(_._2).getOrElse(self.children)
-      )
-
-    def close: State[F, O] = CompileScope.State.closed
+    def close: State[F] = CompileScope.State.closed
   }
 
   private object State {
     private val initial_ =
-      State[Nothing, Nothing](open = true, resources = Chain.empty, children = Chain.empty)
-    def initial[F[_], O]: State[F, O] = initial_.asInstanceOf[State[F, O]]
+      State[Pure](open = true, resources = Chain.empty, children = Chain.empty)
+    def initial[F[_]]: State[F] = initial_.asInstanceOf[State[F]]
 
     private val closed_ =
-      State[Nothing, Nothing](open = false, resources = Chain.empty, children = Chain.empty)
-    def closed[F[_], O]: State[F, O] = closed_.asInstanceOf[State[F, O]]
+      State[Pure](open = false, resources = Chain.empty, children = Chain.empty)
+    def closed[F[_]]: State[F] = closed_.asInstanceOf[State[F]]
   }
 
   /**
@@ -475,7 +445,7 @@ private[internal] object CompileScope {
     *                      Once interrupted, this scope must be closed and `FreeC` must be signalled to provide recovery of the interruption.
     * @param cancelParent  Cancels listening on parent's interrupt.
     */
-  final private[internal] case class InterruptContext[F[_], O](
+  final private[internal] case class InterruptContext[F[_]](
       concurrent: Concurrent[F],
       deferred: Deferred[F, Either[Throwable, Token]],
       ref: Ref[F, Option[Either[Throwable, Token]]],
@@ -498,11 +468,11 @@ private[internal] object CompileScope {
     def childContext(
         interruptible: Option[Concurrent[F]],
         newScopeId: Token
-    )(implicit F: Sync[F]): F[InterruptContext[F, O]] =
+    )(implicit F: Sync[F]): F[InterruptContext[F]] =
       interruptible
         .map { concurent =>
           F.flatMap(concurrent.start(self.deferred.get)) { fiber =>
-            val context = InterruptContext[F, O](
+            val context = InterruptContext[F](
               concurrent = concurrent,
               deferred = Deferred.unsafe[F, Either[Throwable, Token]](concurrent),
               ref = Ref.unsafe[F, Option[Either[Throwable, Token]]](None),
@@ -533,12 +503,12 @@ private[internal] object CompileScope {
       *                       continuation in case of interruption.
       * @param newScopeId     The id of the new scope.
       */
-    def unsafeFromInteruptible[F[_], O](
+    def unsafeFromInterruptible[F[_]](
         interruptible: Option[Concurrent[F]],
         newScopeId: Token
-    )(implicit F: Sync[F]): Option[InterruptContext[F, O]] =
+    )(implicit F: Sync[F]): Option[InterruptContext[F]] =
       interruptible.map { concurrent =>
-        InterruptContext[F, O](
+        InterruptContext[F](
           concurrent = concurrent,
           deferred = Deferred.unsafe[F, Either[Throwable, Token]](concurrent),
           ref = Ref.unsafe[F, Option[Either[Throwable, Token]]](None),

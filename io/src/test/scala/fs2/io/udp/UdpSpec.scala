@@ -17,8 +17,6 @@ import cats.effect.IO
 import cats.implicits._
 import org.scalatest.BeforeAndAfterAll
 
-import TestUtil._
-
 class UdpSpec extends Fs2Spec with BeforeAndAfterAll {
 
   implicit val AG = AsynchronousSocketGroup()
@@ -29,8 +27,9 @@ class UdpSpec extends Fs2Spec with BeforeAndAfterAll {
   "udp" - {
     "echo one" in {
       val msg = Chunk.bytes("Hello, world!".getBytes)
-      runLog {
-        Stream.resource(open[IO]()).flatMap { serverSocket =>
+      Stream
+        .resource(Socket[IO]())
+        .flatMap { serverSocket =>
           Stream.eval(serverSocket.localAddress).map { _.getPort }.flatMap { serverPort =>
             val serverAddress = new InetSocketAddress("localhost", serverPort)
             val server = serverSocket
@@ -39,15 +38,17 @@ class UdpSpec extends Fs2Spec with BeforeAndAfterAll {
                 serverSocket.write(packet)
               }
               .drain
-            val client = Stream.resource(open[IO]()).flatMap { clientSocket =>
+            val client = Stream.resource(Socket[IO]()).flatMap { clientSocket =>
               Stream(Packet(serverAddress, msg))
-                .to(clientSocket.writes())
+                .through(clientSocket.writes())
                 .drain ++ Stream.eval(clientSocket.read())
             }
             server.mergeHaltBoth(client)
           }
         }
-      }.map(_.bytes) shouldBe Vector(msg)
+        .compile
+        .toVector
+        .asserting(_.map(_.bytes) shouldBe Vector(msg))
     }
 
     "echo lots" in {
@@ -56,8 +57,9 @@ class UdpSpec extends Fs2Spec with BeforeAndAfterAll {
       }
       val numClients = 50
       val numParallelClients = 10
-      runLog {
-        Stream.resource(open[IO]()).flatMap { serverSocket =>
+      Stream
+        .resource(Socket[IO]())
+        .flatMap { serverSocket =>
           Stream.eval(serverSocket.localAddress).map { _.getPort }.flatMap { serverPort =>
             val serverAddress = new InetSocketAddress("localhost", serverPort)
             val server = serverSocket
@@ -66,7 +68,7 @@ class UdpSpec extends Fs2Spec with BeforeAndAfterAll {
                 serverSocket.write(packet)
               }
               .drain
-            val client = Stream.resource(open[IO]()).flatMap { clientSocket =>
+            val client = Stream.resource(Socket[IO]()).flatMap { clientSocket =>
               Stream
                 .emits(msgs.map { msg =>
                   Packet(serverAddress, msg)
@@ -82,56 +84,61 @@ class UdpSpec extends Fs2Spec with BeforeAndAfterAll {
             server.mergeHaltBoth(clients)
           }
         }
-      }.map(p => new String(p.bytes.toArray)).sorted shouldBe Vector
-        .fill(numClients)(msgs.map(b => new String(b.toArray)))
-        .flatten
-        .sorted
+        .compile
+        .toVector
+        .asserting(res =>
+          res.map(p => new String(p.bytes.toArray)).sorted shouldBe Vector
+            .fill(numClients)(msgs.map(b => new String(b.toArray)))
+            .flatten
+            .sorted)
     }
 
     "multicast" in {
       pending // Fails often based on routing table of host machine
       val group = InetAddress.getByName("232.10.10.10")
       val msg = Chunk.bytes("Hello, world!".getBytes)
-      runLog {
-        Stream
-          .resource(
-            open[IO](
-              protocolFamily = Some(StandardProtocolFamily.INET),
-              multicastTTL = Some(1)
-            ))
-          .flatMap { serverSocket =>
-            Stream.eval(serverSocket.localAddress).map { _.getPort }.flatMap { serverPort =>
-              val v4Interfaces =
-                NetworkInterface.getNetworkInterfaces.asScala.toList.filter { interface =>
-                  interface.getInetAddresses.asScala.exists(_.isInstanceOf[Inet4Address])
-                }
-              val server = Stream.eval_(
-                v4Interfaces.traverse(interface => serverSocket.join(group, interface))) ++
-                serverSocket
-                  .reads()
-                  .evalMap { packet =>
-                    serverSocket.write(packet)
-                  }
-                  .drain
-              val client = Stream.resource(open[IO]()).flatMap { clientSocket =>
-                Stream(Packet(new InetSocketAddress(group, serverPort), msg))
-                  .to(clientSocket.writes())
-                  .drain ++ Stream.eval(clientSocket.read())
+      Stream
+        .resource(
+          Socket[IO](
+            protocolFamily = Some(StandardProtocolFamily.INET),
+            multicastTTL = Some(1)
+          ))
+        .flatMap { serverSocket =>
+          Stream.eval(serverSocket.localAddress).map { _.getPort }.flatMap { serverPort =>
+            val v4Interfaces =
+              NetworkInterface.getNetworkInterfaces.asScala.toList.filter { interface =>
+                interface.getInetAddresses.asScala.exists(_.isInstanceOf[Inet4Address])
               }
-              server.mergeHaltBoth(client)
+            val server = Stream.eval_(
+              v4Interfaces.traverse(interface => serverSocket.join(group, interface))) ++
+              serverSocket
+                .reads()
+                .evalMap { packet =>
+                  serverSocket.write(packet)
+                }
+                .drain
+            val client = Stream.resource(Socket[IO]()).flatMap { clientSocket =>
+              Stream(Packet(new InetSocketAddress(group, serverPort), msg))
+                .through(clientSocket.writes())
+                .drain ++ Stream.eval(clientSocket.read())
             }
+            server.mergeHaltBoth(client)
           }
-      }.map(_.bytes) shouldBe Vector(msg)
+        }
+        .compile
+        .toVector
+        .asserting(_.map(_.bytes) shouldBe Vector(msg))
     }
 
     "timeouts supported" in {
-      an[InterruptedByTimeoutException] should be thrownBy {
-        runLog {
-          Stream.resource(open[IO]()).flatMap { socket =>
-            socket.reads(timeout = Some(50.millis))
-          }
+      Stream
+        .resource(Socket[IO]())
+        .flatMap { socket =>
+          socket.reads(timeout = Some(50.millis))
         }
-      }
+        .compile
+        .drain
+        .assertThrows[InterruptedByTimeoutException]
     }
   }
 }

@@ -43,12 +43,12 @@ object Broadcast {
       pubSub =>
         def subscriber =
           Stream.bracket(Sync[F].delay(new Token))(pubSub.unsubscribe).flatMap { selector =>
-            Stream
-              .repeatEval(pubSub.get(selector))
+            pubSub
+              .getStream(selector)
               .unNoneTerminate
               .flatMap(Stream.chunk)
-
           }
+
         def publish =
           source.chunks
             .evalMap(chunk => pubSub.publish(Some(chunk)))
@@ -63,7 +63,7 @@ object Broadcast {
     * the supplied pipes.
     *
     * Supplied pipes are run concurrently with each other. Hence, the number of pipes determines concurrency.
-    * Also, this guarantees that each sink will view all `O` pulled from source stream, unlike `broadcast`.
+    * Also, this guarantees that each pipe will view all `O` pulled from source stream, unlike `broadcast`.
     *
     * Resulting values are collected and returned in a single stream of `O2` values.
     *

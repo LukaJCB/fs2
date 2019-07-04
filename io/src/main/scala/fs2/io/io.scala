@@ -1,13 +1,25 @@
 package fs2
 
-import cats.effect.{ConcurrentEffect, ContextShift, IO, Sync}
+import cats.effect.{ConcurrentEffect, ContextShift, Resource, Sync}
 
+import cats._
 import cats.implicits._
 import java.io.{InputStream, OutputStream}
+import java.nio.charset.Charset
+
 import scala.concurrent.{ExecutionContext, blocking}
 
-/** Provides various ways to work with streams that perform IO. */
+/**
+  * Provides various ways to work with streams that perform IO.
+  *
+  * These methods accept a blocking `ExecutionContext`, as the underlying
+  * implementations perform blocking IO. The recommendation is to use an
+  * unbounded thread pool with application level bounds.
+  *
+  * @see [[https://typelevel.org/cats-effect/concurrency/basics.html#blocking-threads]]
+  */
 package object io {
+  private val utf8Charset = Charset.forName("UTF-8")
 
   /**
     * Reads all bytes from the specified `InputStream` with a buffer size of `chunkSize`.
@@ -86,18 +98,21 @@ package object io {
     * Each write operation is performed on the supplied execution context. Writes are
     * blocking so the execution context should be configured appropriately.
     */
-  def writeOutputStream[F[_]](
-      fos: F[OutputStream],
-      blockingExecutionContext: ExecutionContext,
-      closeAfterUse: Boolean = true)(implicit F: Sync[F], cs: ContextShift[F]): Sink[F, Byte] =
+  def writeOutputStream[F[_]](fos: F[OutputStream],
+                              blockingExecutionContext: ExecutionContext,
+                              closeAfterUse: Boolean = true)(
+      implicit F: Sync[F],
+      cs: ContextShift[F]): Pipe[F, Byte, Unit] =
     s => {
       def useOs(os: OutputStream): Stream[F, Unit] =
         s.chunks.evalMap(c => writeBytesToOutputStream(os, c, blockingExecutionContext))
 
-      if (closeAfterUse)
-        Stream.bracket(fos)(os => F.delay(os.close())).flatMap(useOs)
-      else
-        Stream.eval(fos).flatMap(useOs)
+      def close(os: OutputStream): F[Unit] =
+        cs.evalOn(blockingExecutionContext)(F.delay(os.close()))
+
+      val os = if (closeAfterUse) Stream.bracket(fos)(close) else Stream.eval(fos)
+      os.flatMap(os =>
+        useOs(os).scope ++ Stream.eval(cs.evalOn(blockingExecutionContext)(F.delay(os.flush()))))
     }
 
   private def writeBytesToOutputStream[F[_]](os: OutputStream,
@@ -116,10 +131,30 @@ package object io {
       cs: ContextShift[F]): Stream[F, Byte] =
     readInputStream(F.delay(System.in), bufSize, blockingExecutionContext, false)
 
-  /** Sink of bytes that writes emitted values to standard output asynchronously. */
-  def stdout[F[_]](blockingExecutionContext: ExecutionContext)(implicit F: Sync[F],
-                                                               cs: ContextShift[F]): Sink[F, Byte] =
+  /** Pipe of bytes that writes emitted values to standard output asynchronously. */
+  def stdout[F[_]](blockingExecutionContext: ExecutionContext)(
+      implicit F: Sync[F],
+      cs: ContextShift[F]): Pipe[F, Byte, Unit] =
     writeOutputStream(F.delay(System.out), blockingExecutionContext, false)
+
+  /**
+    * Writes this stream to standard output asynchronously, converting each element to
+    * a sequence of bytes via `Show` and the given `Charset`.
+    *
+    * Each write operation is performed on the supplied execution context. Writes are
+    * blocking so the execution context should be configured appropriately.
+    */
+  def stdoutLines[F[_], O](blockingExecutionContext: ExecutionContext,
+                           charset: Charset = utf8Charset)(implicit F: Sync[F],
+                                                           cs: ContextShift[F],
+                                                           show: Show[O]): Pipe[F, O, Unit] =
+    _.map(_.show).through(text.encode(charset)).through(stdout(blockingExecutionContext))
+
+  /** Stream of `String` read asynchronously from standard input decoded in UTF-8. */
+  def stdinUtf8[F[_]](bufSize: Int, blockingExecutionContext: ExecutionContext)(
+      implicit F: Sync[F],
+      cs: ContextShift[F]): Stream[F, String] =
+    stdin(bufSize, blockingExecutionContext).through(text.utf8Decode)
 
   /**
     * Pipe that converts a stream of bytes to a stream that will emits a single `java.io.InputStream`,
@@ -135,9 +170,12 @@ package object io {
     * to operate on the resulting `java.io.InputStream`.
     */
   def toInputStream[F[_]](implicit F: ConcurrentEffect[F]): Pipe[F, Byte, InputStream] =
-    JavaInputOutputStream.toInputStream
+    source => Stream.resource(toInputStreamResource(source))
 
-  private[io] def invokeCallback[F[_]](f: => Unit)(implicit F: ConcurrentEffect[F]): Unit =
-    F.runAsync(F.start(F.delay(f)).flatMap(_.join))(_ => IO.unit).unsafeRunSync
-
+  /**
+    * Like [[toInputStream]] but returns a `Resource` rather than a single element stream.
+    */
+  def toInputStreamResource[F[_]](source: Stream[F, Byte])(
+      implicit F: ConcurrentEffect[F]): Resource[F, InputStream] =
+    JavaInputOutputStream.toInputStream(source)
 }

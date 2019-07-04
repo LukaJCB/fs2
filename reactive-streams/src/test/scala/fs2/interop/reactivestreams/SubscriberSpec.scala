@@ -16,7 +16,7 @@ import org.reactivestreams.tck.{
   SubscriberWhiteboxVerification,
   TestEnvironment
 }
-import org.scalatest.testng.TestNGSuiteLike
+import org.scalatestplus.testng.TestNGSuiteLike
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
@@ -87,7 +87,7 @@ final class SubscriberBlackboxSpec
 
   override def triggerRequest(s: Subscriber[_ >: Int]): Unit = {
     val req = s.asInstanceOf[StreamSubscriber[IO, Int]].sub.dequeue1
-    (Stream.eval(timer.sleep(100.milliseconds) *> req)).compile.drain.unsafeRunAsync(_ => ())
+    (Stream.eval(timer.sleep(100.milliseconds) >> req)).compile.drain.unsafeRunAsync(_ => ())
   }
 
   def createElement(i: Int): Int = counter.incrementAndGet()

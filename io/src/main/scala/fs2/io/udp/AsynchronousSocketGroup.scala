@@ -8,7 +8,7 @@ import scala.concurrent.duration.FiniteDuration
 
 import java.io.IOException
 import java.net.InetSocketAddress
-import java.nio.ByteBuffer
+import java.nio.{Buffer, ByteBuffer}
 import java.nio.channels.{
   CancelledKeyException,
   ClosedChannelException,
@@ -211,10 +211,10 @@ object AsynchronousSocketGroup {
         if (src eq null) {
           false
         } else {
-          readBuffer.flip
+          (readBuffer: Buffer).flip()
           val bytes = new Array[Byte](readBuffer.remaining)
           readBuffer.get(bytes)
-          readBuffer.clear
+          (readBuffer: Buffer).clear()
           reader(Right(new Packet(src, Chunk.bytes(bytes))))
           true
         }
@@ -234,7 +234,7 @@ object AsynchronousSocketGroup {
           if (srcBytes.size == srcBytes.values.size) srcBytes.values
           else {
             val destBytes = new Array[Byte](srcBytes.size)
-            Array.copy(srcBytes.values, 0, destBytes, srcBytes.offset, srcBytes.size)
+            Array.copy(srcBytes.values, srcBytes.offset, destBytes, 0, srcBytes.size)
             destBytes
           }
         }

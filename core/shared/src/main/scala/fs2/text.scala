@@ -2,9 +2,12 @@ package fs2
 
 import java.nio.charset.Charset
 
+import scala.annotation.tailrec
+
 /** Provides utilities for working with streams of text (e.g., encoding byte streams to strings). */
 object text {
   private val utf8Charset = Charset.forName("UTF-8")
+  private val utf8Bom: Chunk[Byte] = Chunk(0xef.toByte, 0xbb.toByte, 0xbf.toByte)
 
   /** Converts UTF-8 encoded byte stream to a stream of `String`. */
   def utf8Decode[F[_]]: Pipe[F, Byte, String] =
@@ -71,17 +74,48 @@ object text {
           Pull.pure(None)
       }
 
+    def processByteOrderMark(
+        buffer: Option[Chunk.Queue[Byte]],
+        s: Stream[Pure, Chunk[Byte]]): Pull[Pure, String, Option[Stream[Pure, Chunk[Byte]]]] =
+      s.pull.uncons1.flatMap {
+        case Some((hd, tl)) =>
+          val newBuffer = buffer.getOrElse(Chunk.Queue.empty[Byte]) :+ hd
+          if (newBuffer.size >= 3) {
+            val rem =
+              if (newBuffer.take(3).toChunk == utf8Bom) newBuffer.drop(3)
+              else newBuffer
+            doPull(Chunk.empty, Stream.emits(rem.chunks) ++ tl)
+          } else {
+            processByteOrderMark(Some(newBuffer), tl)
+          }
+        case None =>
+          buffer match {
+            case Some(b) =>
+              doPull(Chunk.empty, Stream.emits(b.chunks))
+            case None =>
+              Pull.pure(None)
+          }
+      }
+
     (in: Stream[Pure, Chunk[Byte]]) =>
-      doPull(Chunk.empty, in).stream
+      processByteOrderMark(None, in).stream
   }
+
+  /** Encodes a stream of `String` in to a stream of bytes using the given charset. */
+  def encode[F[_]](charset: Charset): Pipe[F, String, Byte] =
+    _.flatMap(s => Stream.chunk(Chunk.bytes(s.getBytes(charset))))
+
+  /** Encodes a stream of `String` in to a stream of `Chunk[Byte]` using the given charset. */
+  def encodeC[F[_]](charset: Charset): Pipe[F, String, Chunk[Byte]] =
+    _.map(s => Chunk.bytes(s.getBytes(charset)))
 
   /** Encodes a stream of `String` in to a stream of bytes using the UTF-8 charset. */
   def utf8Encode[F[_]]: Pipe[F, String, Byte] =
-    _.flatMap(s => Stream.chunk(Chunk.bytes(s.getBytes(utf8Charset))))
+    encode(utf8Charset)
 
   /** Encodes a stream of `String` in to a stream of `Chunk[Byte]` using the UTF-8 charset. */
   def utf8EncodeC[F[_]]: Pipe[F, String, Chunk[Byte]] =
-    _.map(s => Chunk.bytes(s.getBytes(utf8Charset)))
+    encodeC(utf8Charset)
 
   /** Transforms a stream of `String` such that each emitted `String` is a line from the input. */
   def lines[F[_]]: Pipe[F, String, String] = {
@@ -113,11 +147,11 @@ object text {
     def extractLines(buffer: Vector[String],
                      chunk: Chunk[String],
                      pendingLineFeed: Boolean): (Chunk[String], Vector[String], Boolean) = {
-      @annotation.tailrec
-      def loop(remainingInput: Vector[String],
-               buffer: Vector[String],
-               output: Vector[String],
-               pendingLineFeed: Boolean): (Chunk[String], Vector[String], Boolean) =
+      @tailrec
+      def go(remainingInput: Vector[String],
+             buffer: Vector[String],
+             output: Vector[String],
+             pendingLineFeed: Boolean): (Chunk[String], Vector[String], Boolean) =
         if (remainingInput.isEmpty) {
           (Chunk.indexedSeq(output), buffer, pendingLineFeed)
         } else {
@@ -125,22 +159,22 @@ object text {
           if (pendingLineFeed) {
             if (next.headOption == Some('\n')) {
               val out = (buffer.init :+ buffer.last.init).mkString
-              loop(next.tail +: remainingInput.tail, Vector.empty, output :+ out, false)
+              go(next.tail +: remainingInput.tail, Vector.empty, output :+ out, false)
             } else {
-              loop(remainingInput, buffer, output, false)
+              go(remainingInput, buffer, output, false)
             }
           } else {
             val (out, carry) = linesFromString(next)
             val pendingLF =
               if (carry.nonEmpty) carry.last == '\r' else pendingLineFeed
-            loop(remainingInput.tail,
-                 if (out.isEmpty) buffer :+ carry else Vector(carry),
-                 if (out.isEmpty) output
-                 else output ++ ((buffer :+ out.head).mkString +: out.tail),
-                 pendingLF)
+            go(remainingInput.tail,
+               if (out.isEmpty) buffer :+ carry else Vector(carry),
+               if (out.isEmpty) output
+               else output ++ ((buffer :+ out.head).mkString +: out.tail),
+               pendingLF)
           }
         }
-      loop(chunk.toVector, buffer, Vector.empty, pendingLineFeed)
+      go(chunk.toVector, buffer, Vector.empty, pendingLineFeed)
     }
 
     def go(buffer: Vector[String],

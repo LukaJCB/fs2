@@ -2,39 +2,29 @@ package fs2.io
 
 import cats.effect.IO
 import fs2.{Chunk, EventuallySupport, Fs2Spec, Stream}
-import org.scalacheck.{Arbitrary, Gen}
+import org.scalatest.prop.Generator
+
+import scala.annotation.tailrec
 
 class JavaInputOutputStreamSpec extends Fs2Spec with EventuallySupport {
 
   "ToInputStream" - {
 
-    implicit val streamByteGen: Arbitrary[Stream[IO, Byte]] = Arbitrary {
+    implicit val streamByteGenerator: Generator[Stream[IO, Byte]] =
       for {
-        data <- implicitly[Arbitrary[String]].arbitrary
-        chunkSize <- if (data.length > 0) Gen.chooseNum(1, data.length)
-        else Gen.fail
-      } yield {
-        def go(rem: String): Stream[IO, Byte] =
-          if (chunkSize >= rem.length) Stream.chunk(Chunk.bytes(rem.getBytes))
-          else {
-            val (out, remainder) = rem.splitAt(chunkSize)
-            Stream.chunk(Chunk.bytes(out.getBytes)) ++ go(remainder)
-          }
-        go(data)
-      }
-    }
+        chunks <- pureStreamGenerator[Chunk[Byte]]
+      } yield chunks.flatMap(Stream.chunk).covary[IO]
 
     "arbitrary.streams" in forAll { (stream: Stream[IO, Byte]) =>
       val example = stream.compile.toVector.unsafeRunSync()
 
       val fromInputStream =
-        stream
-          .through(toInputStream)
-          .evalMap { is =>
+        toInputStreamResource(stream)
+          .use { is =>
             // consume in same thread pool. Production application should never do this,
             // instead they have to fork this to dedicated thread pool
             val buff = new Array[Byte](20)
-            @annotation.tailrec
+            @tailrec
             def go(acc: Vector[Byte]): IO[Vector[Byte]] =
               is.read(buff) match {
                 case -1   => IO.pure(acc)
@@ -42,9 +32,6 @@ class JavaInputOutputStreamSpec extends Fs2Spec with EventuallySupport {
               }
             go(Vector.empty)
           }
-          .compile
-          .toVector
-          .map(_.flatten)
           .unsafeRunSync()
 
       example shouldBe fromInputStream
@@ -56,7 +43,7 @@ class JavaInputOutputStreamSpec extends Fs2Spec with EventuallySupport {
       val s: Stream[IO, Byte] =
         Stream(1.toByte).onFinalize(IO { closed = true })
 
-      s.through(toInputStream).compile.drain.unsafeRunSync()
+      toInputStreamResource(s).use(_ => IO.unit).unsafeRunSync()
 
       eventually { closed shouldBe true }
     }
@@ -68,23 +55,23 @@ class JavaInputOutputStreamSpec extends Fs2Spec with EventuallySupport {
         Stream(1.toByte).onFinalize(IO { closed = true })
 
       val result =
-        s.through(toInputStream)
-          .evalMap { is =>
+        toInputStreamResource(s)
+          .use { is =>
             IO {
               is.close()
               closed // verifies that once close() terminates upstream was already cleaned up
             }
           }
-          .compile
-          .toVector
           .unsafeRunSync()
 
       result shouldBe Vector(true)
     }
 
     "converts to 0..255 int values except EOF mark" in {
-      val s: Stream[IO, Byte] = Stream.range(0, 256, 1).map(_.toByte)
-      val result = s
+      Stream
+        .range(0, 256, 1)
+        .map(_.toByte)
+        .covary[IO]
         .through(toInputStream)
         .map { is =>
           Vector.fill(257)(is.read())
@@ -92,8 +79,7 @@ class JavaInputOutputStreamSpec extends Fs2Spec with EventuallySupport {
         .compile
         .toVector
         .map(_.flatten)
-        .unsafeRunSync()
-      result shouldBe (Stream.range(0, 256, 1) ++ Stream(-1)).toVector
+        .asserting(_ shouldBe (Stream.range(0, 256, 1) ++ Stream(-1)).toVector)
     }
   }
 }

@@ -1,6 +1,7 @@
 package fs2
 
 import cats._
+import cats.arrow.FunctionK
 import cats.effect._
 import fs2.internal._
 
@@ -83,7 +84,7 @@ final class Pull[+F[_], +O, +R] private (private val free: FreeC[Algebra[Nothing
 
   /** Run `p2` after `this`, regardless of errors during `this`, then reraise any errors encountered during `this`. */
   def onComplete[F2[x] >: F[x], O2 >: O, R2 >: R](p2: => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
-    handleErrorWith(e => p2 >> new Pull(Algebra.raiseError[Nothing, Nothing, Nothing](e))) >> p2
+    handleErrorWith(e => p2 >> new Pull(Algebra.raiseError[Nothing, Nothing](e))) >> p2
 
   /** If `this` terminates with `Pull.raiseError(e)`, invoke `h(e)`. */
   def handleErrorWith[F2[x] >: F[x], O2 >: O, R2 >: R](
@@ -145,12 +146,16 @@ object Pull extends PullLowPriority {
   def acquireCancellableCase[F[_]: RaiseThrowable, R](r: F[R])(
       cleanup: (R, ExitCase[Throwable]) => F[Unit]): Pull[F, INothing, Cancellable[F, R]] =
     Stream
-      .bracketWithToken(r)(cleanup)
+      .bracketWithResource(r)(cleanup)
       .pull
       .uncons1
       .flatMap {
-        case None                   => Pull.raiseError[F](new RuntimeException("impossible"))
-        case Some(((token, r), tl)) => Pull.pure(Cancellable(release(token), r))
+        case None => Pull.raiseError[F](new RuntimeException("impossible"))
+        case Some(((res, r), tl)) =>
+          Pull.pure(Cancellable(Pull.eval(res.release(ExitCase.Canceled)).flatMap {
+            case Left(t)  => Pull.fromFreeC(Algebra.raiseError[F, INothing](t))
+            case Right(r) => Pull.pure(r)
+          }, r))
       }
 
   /**
@@ -180,14 +185,7 @@ object Pull extends PullLowPriority {
     r => using(r).flatMap { _.map(loop(using)).getOrElse(Pull.pure(None)) }
 
   private def mapOutput[F[_], O, O2, R](p: Pull[F, O, R])(f: O => O2): Pull[F, O2, R] =
-    Pull.fromFreeC(
-      p.get[F, O, R]
-        .translate(new (Algebra[F, O, ?] ~> Algebra[F, O2, ?]) {
-          def apply[X](in: Algebra[F, O, X]): Algebra[F, O2, X] = in match {
-            case o: Algebra.Output[F, O] => Algebra.Output(o.values.map(f))
-            case other                   => other.asInstanceOf[Algebra[F, O2, X]]
-          }
-        }))
+    Pull.fromFreeC(p.get[F, O, R].translate(Algebra.mapOutput(f)))
 
   /** Outputs a single value. */
   def output1[F[x] >: Pure[x], O](o: O): Pull[F, O, Unit] =
@@ -199,7 +197,7 @@ object Pull extends PullLowPriority {
 
   /** Pull that outputs nothing and has result of `r`. */
   def pure[F[x] >: Pure[x], R](r: R): Pull[F, INothing, R] =
-    fromFreeC(Algebra.pure(r))
+    fromFreeC(Algebra.pure[F, INothing, R](r))
 
   /**
     * Reads and outputs nothing, and fails with the given error.
@@ -207,7 +205,7 @@ object Pull extends PullLowPriority {
     * The `F` type must be explicitly provided (e.g., via `raiseError[IO]` or `raiseError[Fallible]`).
     */
   def raiseError[F[_]: RaiseThrowable](err: Throwable): Pull[F, INothing, INothing] =
-    new Pull(Algebra.raiseError[Nothing, Nothing, Nothing](err))
+    new Pull(Algebra.raiseError[Nothing, Nothing](err))
 
   final class PartiallyAppliedFromEither[F[_]] {
     def apply[A](either: Either[Throwable, A])(implicit ev: RaiseThrowable[F]): Pull[F, A, Unit] =
@@ -234,9 +232,6 @@ object Pull extends PullLowPriority {
   def suspend[F[x] >: Pure[x], O, R](p: => Pull[F, O, R]): Pull[F, O, R] =
     fromFreeC(Algebra.suspend(p.get))
 
-  private def release[F[x] >: Pure[x]](token: Token): Pull[F, INothing, Unit] =
-    fromFreeC[F, INothing, Unit](Algebra.release(token, None))
-
   /** `Sync` instance for `Pull`. */
   implicit def syncInstance[F[_], O](
       implicit ev: ApplicativeError[F, Throwable]): Sync[Pull[F, O, ?]] =
@@ -259,15 +254,27 @@ object Pull extends PullLowPriority {
             .syncInstance[Algebra[F, O, ?]]
             .bracketCase(acquire.get)(a => use(a).get)((a, c) => release(a, c).get))
     }
+
+  /**
+    * `FunctionK` instance for `F ~> Pull[F, INothing, ?]`
+    *
+    * @example {{{
+    * scala> import cats.Id
+    * scala> Pull.functionKInstance[Id](42).flatMap(Pull.output1).stream.compile.toList
+    * res0: cats.Id[List[Int]] = List(42)
+    * }}}
+    */
+  implicit def functionKInstance[F[_]]: F ~> Pull[F, INothing, ?] =
+    FunctionK.lift[F, Pull[F, INothing, ?]](Pull.eval)
 }
 
 private[fs2] trait PullLowPriority {
   implicit def monadInstance[F[_], O]: Monad[Pull[F, O, ?]] =
     new Monad[Pull[F, O, ?]] {
       override def pure[A](a: A): Pull[F, O, A] = Pull.pure(a)
-      override def flatMap[A, B](p: Pull[F, O, A])(f: A ⇒ Pull[F, O, B]): Pull[F, O, B] =
+      override def flatMap[A, B](p: Pull[F, O, A])(f: A => Pull[F, O, B]): Pull[F, O, B] =
         p.flatMap(f)
-      override def tailRecM[A, B](a: A)(f: A ⇒ Pull[F, O, Either[A, B]]): Pull[F, O, B] =
+      override def tailRecM[A, B](a: A)(f: A => Pull[F, O, Either[A, B]]): Pull[F, O, B] =
         f(a).flatMap {
           case Left(a)  => tailRecM(a)(f)
           case Right(b) => Pull.pure(b)
